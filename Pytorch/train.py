@@ -11,6 +11,18 @@ import config
 # File path to store generated data
 DATA_FILE_PATH = "generated_data.txt"
 
+# For comparison between TensorFlow and PyTorch code
+seed = 42
+
+# Setting random seeds for reproducibility
+def set_random_seeds(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU if applicable
+    torch.backends.cudnn.deterministic = True  # Ensures deterministic behavior
+    torch.backends.cudnn.benchmark = False  # Ensures reproducibility over speed
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_agents', type=int, required=True)
@@ -203,6 +215,9 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
 def main():
     args = parse_args()
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    
+    # Set random seed for reproducibility
+    set_random_seeds(seed)
     
     model_cbf = core.NetworkCBF().to(device)
     model_action = core.NetworkAction().to(device)

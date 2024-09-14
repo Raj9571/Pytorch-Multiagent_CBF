@@ -89,7 +89,7 @@ def main():
     model_cbf_eval = core.NetworkCBF()
     model_action_eval = core.NetworkAction()
 
-    checkpoint = torch.load("model_iter_8000 (1).pth")
+    checkpoint = torch.load("models/model_iter_4000.pth")
     model_cbf_eval.load_state_dict(checkpoint['model_cbf_state_dict'])
     model_action_eval.load_state_dict(checkpoint['model_action_state_dict'])
     

@@ -32,6 +32,7 @@ def parse_args():
     return args
 
 class AgentDataset(Dataset):
+   
     def __init__(self, num_agents, dist_min_thres, num_samples=1000, device="cpu"):
         super(AgentDataset, self).__init__()
         self.num_agents = num_agents
@@ -41,7 +42,6 @@ class AgentDataset(Dataset):
         self.data = self.load_or_generate_data()
 
     def load_or_generate_data(self):
-        # Check if the data file exists
         if os.path.exists(DATA_FILE_PATH):
             print(f"Loading data from {DATA_FILE_PATH}...")
             return self.load_data_from_file()
@@ -73,15 +73,20 @@ class AgentDataset(Dataset):
 
     def __getitem__(self, idx):
         states, goals = self.data[idx]
-        states_tensor = torch.tensor(states, dtype=torch.float32).to(self.device)
-        goals_tensor = torch.tensor(goals, dtype=torch.float32).to(self.device)
+        states_tensor = torch.tensor(states, dtype=torch.float32)
+        goals_tensor = torch.tensor(goals, dtype=torch.float32)
         return states_tensor, goals_tensor
+
 
 def count_accuracy(accuracy_lists):
     acc = np.array(accuracy_lists)
     acc_list = []
     for i in range(acc.shape[1]):
-        acc_list.append(np.mean(acc[acc[:, i] >= 0, i]))
+        valid_acc = acc[acc[:, i] >= 0, i]
+        if len(valid_acc) > 0:
+            acc_list.append(np.mean(valid_acc))
+        else:
+            acc_list.append(0.0)
     return acc_list
 
 def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, optimizer_action, device):
@@ -97,26 +102,31 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
     state_gain = main_diag + shifted_diag * np.sqrt(3)
 
     accumulation_steps = config.INNER_LOOPS  # Define accumulation steps
-    optimizer_cbf.zero_grad()
-    optimizer_action.zero_grad()
-    
+
     for istep, (states, goals) in enumerate(dataloader):
-        loss_lists_np = []
-        acc_lists_np = []
-        safety_ratios_epoch = []
-        safety_ratios_epoch_lqr = []
+        if istep >= config.TRAIN_STEPS:
+            break  # Limit the training steps
 
         # Ensure the correct shapes and data movement
         s_np = states.squeeze(0).to(device)
         g_np = goals.squeeze(0).to(device)
-        
+
         s_np_lqr = s_np.clone()
         g_np_lqr = g_np.clone()
 
-        steps_accumulated=0
+        loss_lists_cbf = []
+        loss_lists_action = []
+        acc_lists_np = []
 
-        # Apply gradient accumulation here
+        steps_accumulated = 0
+
+        # Zero gradients before starting accumulation
+        optimizer_cbf.zero_grad()
+        optimizer_action.zero_grad()
+
+        # Accumulate losses over multiple steps
         for i in range(accumulation_steps):
+            # Compute the control input a_np using the action network
             a_np = model_action(s_np, g_np)
 
             if np.random.uniform() < config.ADD_NOISE_PROB:
@@ -125,27 +135,23 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
 
             # Simulating the system for one step
             s_np = s_np + torch.cat([s_np[:, 2:], a_np], dim=1) * config.TIME_STEP
-            torch.set_printoptions(precision=8)
-            #print(s_np)
+
             # Compute safety ratio
             s_np_detached = s_np.detach().cpu().numpy()  # Ensure tensor is detached for numpy operations
-            #print(s_np_detached)
             safety_mask_np = core.ttc_dangerous_mask_np(
                 s_np_detached, config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK)
-            
+
             # Convert the safety mask to a tensor
             safety_mask_tensor = torch.tensor(safety_mask_np, dtype=torch.float32).to(device)
-            
+
             safety_ratio = 1 - torch.mean(safety_mask_tensor, dim=1)
             safety_ratio = torch.mean((safety_ratio == 1).float())
-            safety_ratios_epoch.append(safety_ratio.item())
-
-        
 
             # CBF and loss calculations
             x = s_np.unsqueeze(1) - s_np.unsqueeze(0)
             h, mask, indices = model_cbf(x, config.DIST_MIN_THRES, indices=None)
 
+            # Compute losses
             loss_action = core.loss_actions(s=s_np, g=g_np, a=a_np, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION)
 
             (loss_dang_deriv, loss_safe_deriv, acc_dang_deriv, acc_safe_deriv) = core.loss_derivatives(
@@ -155,56 +161,39 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
             (loss_dang, loss_safe, acc_dang, acc_safe) = core.loss_barrier(
                 h=h, s=s_np, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION)
 
-            loss_list_np = [2 * loss_dang, loss_safe, 2 * loss_dang_deriv, loss_safe_deriv, 0.01 * loss_action]
-            acc_list_np = [acc_dang, acc_safe, acc_dang_deriv, acc_safe_deriv]
-            loss_lists_np.append(loss_list_np)
-            acc_lists_np.append(acc_list_np)
-            
+            # Accumulate losses
+            loss_cbf_list = [2 * loss_dang, loss_safe, 2 * loss_dang_deriv, loss_safe_deriv]
+            loss_action_scalar = 0.01 * loss_action
+
+            loss_lists_cbf.append(sum(loss_cbf_list))
+            loss_lists_action.append(loss_action_scalar)
+            acc_lists_np.append([acc_dang.item(), acc_safe.item(), acc_dang_deriv.item(), acc_safe_deriv.item()])
+
             steps_accumulated += 1
             if torch.mean(torch.norm(s_np[:, :2] - g_np, dim=1)) < config.DIST_MIN_CHECK:
                 break
 
-        # Running the LQR controller
-        for i in range(accumulation_steps):
-            s_ref_lqr = torch.cat([s_np_lqr[:, :2] - g_np_lqr, s_np_lqr[:, 2:]], dim=1)
-            a_lqr = -s_ref_lqr.matmul(state_gain.T)
-            s_np_lqr = s_np_lqr + torch.cat([s_np_lqr[:, 2:], a_lqr], dim=1) * config.TIME_STEP
-            s_np_lqr[:, :2] = torch.clamp(s_np_lqr[:, :2], 0, 1)
+        # Combining losses for CBF network
+        total_loss_cbf = torch.stack(loss_lists_cbf).sum()
+        # Adding weight decay is handled by the optimizer's weight_decay parameter
 
-            s_np_lqr_detached = s_np_lqr.detach().cpu().numpy()  # Detach for numpy operation
-            safety_mask_lqr_np = core.ttc_dangerous_mask_np(
-                s_np_lqr_detached, config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK)
-            
-            # Convert the safety mask to a tensor
-            safety_mask_lqr_tensor = torch.tensor(safety_mask_lqr_np, dtype=torch.float32).to(device)
-            
-            safety_ratio_lqr = 1 - torch.mean(safety_mask_lqr_tensor, dim=1)
-            safety_ratio_lqr = torch.mean((safety_ratio_lqr == 1).float())
-            safety_ratios_epoch_lqr.append(safety_ratio_lqr.item())
-            
-        
-            if torch.mean(torch.norm(s_np_lqr[:, :2] - g_np_lqr, dim=1)) < config.DIST_MIN_CHECK:
-                break
-
-        # Combining losses
-        params = list(model_action.parameters()) + list(model_cbf.parameters())
-        weight_loss = config.WEIGHT_DECAY * sum([param.pow(2).sum() for param in params])
-        loss = 10 * (torch.sum(torch.stack([tensor for sublist in loss_lists_np for tensor in sublist])) + weight_loss)
-        loss=loss/steps_accumulated #average loss for gradient accumulation
-        # Accumulating gradients
-        loss.backward()
-
-        # Perform the optimizer step after accumulation steps
+        # Backward pass and optimizer step for CBF network
         if (istep // 10) % 2 == 0:
+            total_loss_cbf.backward()
             optimizer_cbf.step()
-        else:
+            optimizer_cbf.zero_grad()
+
+        # Combining losses for action network
+        total_loss_action = torch.stack(loss_lists_action).sum()
+
+        # Backward pass and optimizer step for action network
+        if (istep // 10) % 2 != 0:
+            total_loss_action.backward()
             optimizer_action.step()
+            optimizer_action.zero_grad()
 
-        # Clear gradients
-        optimizer_cbf.zero_grad()
-        optimizer_action.zero_grad()
-
-        total_loss += loss.item()
+        # Accumulate total loss for reporting
+        total_loss += (total_loss_cbf.item() + total_loss_action.item())
         avg_loss = total_loss / (istep + 1)
 
         # Saving the model at specific intervals
@@ -216,24 +205,29 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
                 'model_cbf_state_dict': model_cbf.state_dict(),
                 'model_action_state_dict': model_action.state_dict(),
             }, os.path.join('models', f'model_iter_{istep + 1}.pth'))
-        
-        print(f'Step [{istep + 1}/{config.TRAIN_STEPS}], Loss: {avg_loss:.4f}, accuracy: {np.array(count_accuracy(acc_lists_np))}')
+
+        if (istep + 1) % config.DISPLAY_STEPS == 0:
+            print('Step: {}, Loss: {:.4f}, Accuracy: {}'.format(
+                istep + 1, avg_loss, np.array(count_accuracy(acc_lists_np))))
+            # Resetting accumulators for next display interval
+            total_loss = 0
 
     return avg_loss
 
 def main():
     args = parse_args()
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    
+    print("Hii start")
+
     # Set random seed for reproducibility
     set_random_seeds(seed)
-    
+
     model_cbf = core.NetworkCBF().to(device)
     model_action = core.NetworkAction().to(device)
-    
-    optimizer_cbf = optim.SGD(model_cbf.parameters(), lr=config.LEARNING_RATE)
-    optimizer_action = optim.SGD(model_action.parameters(), lr=config.LEARNING_RATE)
-     
+
+    optimizer_cbf = optim.Adam(model_cbf.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    optimizer_action = optim.Adam(model_action.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+
     if args.model_path is not None:
         if os.path.exists(args.model_path):
             print(f"Loading model from {args.model_path}...")
@@ -242,7 +236,8 @@ def main():
             model_action.load_state_dict(checkpoint['model_action_state_dict'])
         else:
             print(f"Model path {args.model_path} does not exist. Starting training from scratch.")
-    dataset = AgentDataset(args.num_agents, config.DIST_MIN_THRES, num_samples=70000, device=device)
+
+    dataset = AgentDataset(args.num_agents, config.DIST_MIN_THRES, num_samples=config.TRAIN_STEPS, device=device)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     avg_loss = train_epoch(args.num_agents, model_cbf, model_action, dataloader, optimizer_cbf, optimizer_action, device)

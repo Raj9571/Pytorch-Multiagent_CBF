@@ -34,12 +34,16 @@ def get_next(s, g, a, model_cbf, device):
         s_next (torch.Tensor): Next state after applying refined action
         a_opt (torch.Tensor): Optimized action after refinement
         x_next (torch.Tensor): Relative positions after refinement
+        indices (torch.Tensor): Indices of top K nearest agents
     """
     # Compute relative positions
     x = s.unsqueeze(1) - s.unsqueeze(0)  # [num_agents, num_agents, 4]
     
-    # Compute CBF values and masks
-    h, mask, _ = model_cbf(x=x, r=config.DIST_MIN_THRES)
+    # Compute CBF values and masks, get indices
+    h, mask, indices = model_cbf(x=x, r=config.DIST_MIN_THRES)
+    # Detach h and mask to prevent autograd from tracking their history
+    h = h.detach()
+    mask = mask.detach()
     
     # Initialize a_res with requires_grad=True
     a_res = torch.zeros_like(a, requires_grad=True).to(device)
@@ -59,18 +63,18 @@ def get_next(s, g, a, model_cbf, device):
         # Compute next relative positions
         x_next = s_next.unsqueeze(1) - s_next.unsqueeze(0)  # [num_agents, num_agents, 4]
         
-        # Compute CBF values and masks for next state
-        h_next, mask_next, _ = model_cbf(x=x_next, r=config.DIST_MIN_THRES)
+        # Compute CBF values and masks for next state, using indices
+        h_next, mask_next, _ = model_cbf(x=x_next, r=config.DIST_MIN_THRES, indices=indices)
         
         # Compute derivative condition
-        deriv = h_next - h + config.TIME_STEP * config.ALPHA_CBF * h  # [num_agents, num_agents, 1]
+        deriv = h_next - h + config.TIME_STEP * config.ALPHA_CBF * h  # [num_agents, TOP_K, 1]
         deriv = deriv * mask * mask_next  # Apply masks
         
         # Compute error: sum of negative derivations
-        error = torch.sum(torch.relu(-deriv), dim=1).sum()  # Scalar
+        error = torch.sum(torch.relu(-deriv))
         
         # Backpropagate to compute gradients
-        error.backward(retain_graph=True)
+        error.backward()
         
         # Perform optimization step
         optimizer.step()
@@ -87,17 +91,21 @@ def get_next(s, g, a, model_cbf, device):
     # Compute relative positions for next state
     x_next = s_next.unsqueeze(1) - s_next.unsqueeze(0)  # [num_agents, num_agents, 4]
     
-    # Compute CBF values and masks for next state
-    h_next, mask_next, _ = model_cbf(x=x_next, r=config.DIST_MIN_THRES)
+    # Compute CBF values and masks for next state, using indices
+    h_next, mask_next, _ = model_cbf(x=x_next, r=config.DIST_MIN_THRES, indices=indices)
     
-    return h_next, s_next, a_opt, x_next
+    return h_next, s_next, a_opt, x_next, indices
 
 def print_accuracy(accuracy_lists):
     acc = np.array(accuracy_lists)
     acc_list = []
     for i in range(acc.shape[1]):
         acc_i = acc[:, i]
-        acc_list.append(np.mean(acc_i[acc_i > 0]))
+        valid_acc = acc_i[acc_i >= 0]
+        if len(valid_acc) > 0:
+            acc_list.append(np.mean(valid_acc))
+        else:
+            acc_list.append(0.0)
     print('Accuracy: {}'.format(acc_list))
 
 def render_init():
@@ -108,7 +116,7 @@ def main():
     args = parse_args()
     
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     
     # Initialize models
     model_cbf_eval = core.NetworkCBF().to(device)
@@ -168,59 +176,58 @@ def main():
                 a_network = model_action_eval(s_np, g_np)  # [num_agents, 2]
             
             # Refine the action using CBF
-            h_next, s_next, a_opt, x_next = get_next(s_np, g_np, a_network, model_cbf_eval, device)
+            h_next, s_next, a_opt, x_next, indices = get_next(s_np, g_np, a_network, model_cbf_eval, device)
             
-            # Compute safety metrics
+            # Compute losses and accuracies
+            (loss_dang, loss_safe, acc_dang, acc_safe) = core.loss_barrier(
+                h=h_next, s=s_next, r=config.DIST_MIN_THRES, 
+                ttc=config.TIME_TO_COLLISION, model_cbf=model_cbf_eval, indices=indices, eps=[0, 0])
+
+            (loss_dang_deriv, loss_safe_deriv, acc_dang_deriv, acc_safe_deriv) = core.loss_derivatives(
+                s=s_next, a=a_opt, h=h_next, x=x_next, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION, 
+                alpha=config.ALPHA_CBF, time_step=config.TIME_STEP, dist_min_thres=config.DIST_MIN_THRES, 
+                model_cbf=model_cbf_eval, indices=indices)
+
+            # Compute action loss
+            loss_action = core.loss_actions(s_np, g_np, a_network, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION)
+
+            acc_list_np = [acc_dang.item(), acc_safe.item(), acc_dang_deriv.item(), acc_safe_deriv.item()]
+
+            # Update state with optimized action
             s_np = s_next  # Update state with optimized action
             s_np_ours.append(s_np.cpu().numpy())
             
-            safety_ratio = 1 - np.mean(core.ttc_dangerous_mask_np(
-                s_np.cpu().numpy(), config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK), axis=1)
+            # Compute safety metrics
+            safety_mask_np = core.ttc_dangerous_mask_np(
+                s_np.cpu().numpy(), config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK)
+            safety_ratio = 1 - np.mean(safety_mask_np, axis=1)
             safety_ours.append(safety_ratio)
             safety_info.append((safety_ratio == 1).astype(np.float32).reshape((1, -1)))
             safety_ratio_mean = np.mean(safety_ratio == 1)
             safety_ratios_epoch.append(safety_ratio_mean)
-            
-            # Compute accuracy lists (assuming loss_list is not directly used here)
-            # If loss_list is needed, compute it similarly as in TensorFlow code
-            # For simplicity, we'll skip it here as it depends on the core module's implementation
-            
-            # Handle visualization
+            accuracy_lists.append(acc_list_np)
+
+            # Check if agents are close to their goals
+            if torch.mean(torch.norm(s_np[:, :2] - g_np, dim=1)).item() < config.DIST_MIN_CHECK:
+                break
+
             if args.vis:
-                # Break if agents are very close to their goals
+                # Visualization
                 if torch.max(torch.norm(s_np[:, :2] - g_np, dim=1)).item() < config.DIST_MIN_CHECK / 3:
                     time.sleep(1)
                     break
-                # Switch to LQR if agents are close to goals
-                if torch.mean(torch.norm(s_np[:, :2] - g_np, dim=1)).item() < config.DIST_MIN_CHECK / 2:
-                    K = np.eye(2, 4) + np.eye(2, 4, k=2) * np.sqrt(3)
-                    s_ref = torch.cat([s_np[:, :2] - g_np, s_np[:, 2:]], dim=1).cpu().numpy()  # [num_agents, 4]
-                    a_lqr = -s_ref.dot(K.T)  # [num_agents, 2]
-                    a_lqr_tensor = torch.tensor(a_lqr, dtype=torch.float32).to(device)
-                    dsdt_lqr = torch.cat([s_np[:, 2:], a_lqr_tensor], dim=1)  # [num_agents, 4]
-                    s_np = s_np + dsdt_lqr * config.TIME_STEP
-                    s_np_ours.append(s_np.cpu().numpy())
-                    safety_ratio = 1 - np.mean(core.ttc_dangerous_mask_np(
-                        s_np.cpu().numpy(), config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK), axis=1)
-                    safety_ours.append(safety_ratio)
-                    safety_info.append((safety_ratio == 1).astype(np.float32).reshape((1, -1)))
-                    safety_ratio_mean = np.mean(safety_ratio == 1)
-                    safety_ratios_epoch.append(safety_ratio_mean)
-                    break  # Exit the inner loop after switching to LQR
 
         # Compute distance error
         dist_errors.append(np.mean(np.linalg.norm(s_np[:, :2].cpu().numpy() - g_np.cpu().numpy(), axis=1)))
-        init_dist_errors.append(np.mean(np.linalg.norm(s_np_ori[:, :2] - g_np_ori, axis=1)))
-        
-        # Compute rewards (assuming similar logic as TensorFlow code)
+
+        # Compute rewards
         safety_reward.append(np.mean(np.sum(np.concatenate(safety_info, axis=0) - 1, axis=0)))
         dist_reward.append(np.mean(
             (np.linalg.norm((s_np[:, :2] - g_np).cpu().numpy(), axis=1) < 0.2).astype(np.float32) * 10))
-        
+
         # Run simulation using LQR controller without considering collision
-        s_np_lqr = []
         s_np_lqr_current = torch.tensor(s_np_ori, dtype=torch.float32).to(device)  # Reset to initial state
-        
+
         for i in range(config.INNER_LOOPS):
             K = np.eye(2, 4) + np.eye(2, 4, k=2) * np.sqrt(3)
             s_ref = torch.cat([s_np_lqr_current[:, :2] - g_np, s_np_lqr_current[:, 2:]], dim=1).cpu().numpy()
@@ -231,8 +238,9 @@ def main():
             s_np_lqr.append(s_np_lqr_current.cpu().numpy())
             
             # Compute safety metrics for LQR
-            safety_ratio_lqr = 1 - np.mean(core.ttc_dangerous_mask_np(
-                s_np_lqr_current.cpu().numpy(), config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK), axis=1)
+            safety_mask_np_lqr = core.ttc_dangerous_mask_np(
+                s_np_lqr_current.cpu().numpy(), config.DIST_MIN_CHECK, config.TIME_TO_COLLISION_CHECK)
+            safety_ratio_lqr = 1 - np.mean(safety_mask_np_lqr, axis=1)
             safety_lqr.append(safety_ratio_lqr)
             safety_info_baseline.append((safety_ratio_lqr == 1).astype(np.float32).reshape((1, -1)))
             safety_ratio_mean_lqr = np.mean(safety_ratio_lqr == 1)
@@ -247,10 +255,7 @@ def main():
             np.sum(np.concatenate(safety_info_baseline, axis=0) - 1, axis=0)))
         dist_reward_baseline.append(np.mean(
             (np.linalg.norm(s_np_lqr_current[:, :2].cpu().numpy() - g_np.cpu().numpy(), axis=1) < 0.2).astype(np.float32) * 10))
-        
-        # Update distance error for LQR
-        dist_errors.append(np.mean(np.linalg.norm(s_np_lqr_current[:, :2].cpu().numpy() - g_np.cpu().numpy(), axis=1)))
-        
+
         if args.vis:
             # Visualize the trajectories
             vis_range = max(1, np.amax(np.abs(s_np_ori[:, :2])))
@@ -311,12 +316,12 @@ def main():
                 plt.title('LQR: Safety Rate = {:.3f}'.format(
                     np.mean(safety_ratios_epoch_lqr)), fontsize=14)
 
-                fig.canvas.draw()
+                plt.draw()
                 plt.pause(0.01)
             plt.clf()
 
         end_time = time.time()
-        print('Evaluation Step: {} | {}, Time: {:.4f}'.format(
+        print('Evaluation Step: {} / {}, Time: {:.4f}'.format(
             istep + 1, config.EVALUATE_STEPS, end_time - start_time))
 
     # After all evaluation steps, print metrics
@@ -328,6 +333,10 @@ def main():
     print('Reward Safety (Learning | LQR): {:.4f} | {:.4f}, Reward Distance: {:.4f} | {:.4f}'.format(
         np.mean(safety_reward), np.mean(safety_reward_baseline), 
         np.mean(dist_reward), np.mean(dist_reward_baseline)))
+
+    if args.vis:
+        plt.ioff()
+        plt.show()
 
 if __name__ == '__main__':
     main()

@@ -1,15 +1,11 @@
 import argparse
 import os
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import core
 import config
-
-# File path to store generated data
-DATA_FILE_PATH = "generated_data.txt"
 
 # For comparison between TensorFlow and PyTorch code
 seed = 42
@@ -32,41 +28,17 @@ def parse_args():
     return args
 
 class AgentDataset(Dataset):
-   
     def __init__(self, num_agents, dist_min_thres, num_samples=1000, device="cpu"):
         super(AgentDataset, self).__init__()
         self.num_agents = num_agents
         self.dist_min_thres = dist_min_thres
         self.num_samples = num_samples
         self.device = device
-        self.data = self.load_or_generate_data()
+        self.data = self.generate_data()
 
-    def load_or_generate_data(self):
-        if os.path.exists(DATA_FILE_PATH):
-            print(f"Loading data from {DATA_FILE_PATH}...")
-            return self.load_data_from_file()
-        else:
-            print(f"Generating new data and saving to {DATA_FILE_PATH}...")
-            data = [core.generate_data(self.num_agents, self.dist_min_thres) for _ in range(self.num_samples)]
-            self.save_data_to_file(data)
-            return data
-
-    def load_data_from_file(self):
-        data = []
-        with open(DATA_FILE_PATH, "r") as file:
-            for line in file:
-                states, goals = line.strip().split(";")
-                states = np.fromstring(states, sep=',').reshape(self.num_agents, 4)
-                goals = np.fromstring(goals, sep=',').reshape(self.num_agents, 2)
-                data.append((states, goals))
+    def generate_data(self):
+        data = [core.generate_data(self.num_agents, self.dist_min_thres) for _ in range(self.num_samples)]
         return data
-
-    def save_data_to_file(self, data):
-        with open(DATA_FILE_PATH, "w") as file:
-            for states, goals in data:
-                states_str = ",".join(map(str, states.flatten()))
-                goals_str = ",".join(map(str, goals.flatten()))
-                file.write(f"{states_str};{goals_str}\n")
 
     def __len__(self):
         return self.num_samples
@@ -76,7 +48,6 @@ class AgentDataset(Dataset):
         states_tensor = torch.tensor(states, dtype=torch.float32)
         goals_tensor = torch.tensor(goals, dtype=torch.float32)
         return states_tensor, goals_tensor
-
 
 def count_accuracy(accuracy_lists):
     acc = np.array(accuracy_lists)
@@ -94,13 +65,6 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
     model_action.train()
     total_loss = 0
 
-    # Creating the state_gain matrix
-    main_diag = torch.eye(2, 4, device=device)
-    shifted_diag = torch.zeros(2, 4, device=device)
-    shifted_diag[0, 2] = 1
-    shifted_diag[1, 3] = 1
-    state_gain = main_diag + shifted_diag * np.sqrt(3)
-
     accumulation_steps = config.INNER_LOOPS  # Define accumulation steps
 
     for istep, (states, goals) in enumerate(dataloader):
@@ -110,9 +74,6 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
         # Ensure the correct shapes and data movement
         s_np = states.squeeze(0).to(device)
         g_np = goals.squeeze(0).to(device)
-
-        s_np_lqr = s_np.clone()
-        g_np_lqr = g_np.clone()
 
         loss_lists_cbf = []
         loss_lists_action = []
@@ -155,11 +116,12 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
             loss_action = core.loss_actions(s=s_np, g=g_np, a=a_np, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION)
 
             (loss_dang_deriv, loss_safe_deriv, acc_dang_deriv, acc_safe_deriv) = core.loss_derivatives(
-                s=s_np, a=a_np, h=h, x=x, r=config.OBS_RADIUS, ttc=config.TIME_TO_COLLISION,
-                alpha=config.ALPHA_CBF, time_step=config.TIME_STEP, dist_min_thres=config.DIST_MIN_THRES)
+                s=s_np, a=a_np, h=h, x=x, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION,
+                alpha=config.ALPHA_CBF, time_step=config.TIME_STEP, dist_min_thres=config.DIST_MIN_THRES,
+                model_cbf=model_cbf)
 
             (loss_dang, loss_safe, acc_dang, acc_safe) = core.loss_barrier(
-                h=h, s=s_np, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION)
+                h=h, s=s_np, r=config.DIST_MIN_THRES, ttc=config.TIME_TO_COLLISION, model_cbf=model_cbf, indices=indices)
 
             # Accumulate losses
             loss_cbf_list = [2 * loss_dang, loss_safe, 2 * loss_dang_deriv, loss_safe_deriv]
@@ -175,7 +137,9 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
 
         # Combining losses for CBF network
         total_loss_cbf = torch.stack(loss_lists_cbf).sum()
-        # Adding weight decay is handled by the optimizer's weight_decay parameter
+        # Manually add weight decay (L2 regularization)
+        weight_loss_cbf = [config.WEIGHT_DECAY * (p ** 2).sum() for p in model_cbf.parameters()]
+        total_loss_cbf = 10 * (total_loss_cbf + sum(weight_loss_cbf)) / steps_accumulated
 
         # Backward pass and optimizer step for CBF network
         if (istep // 10) % 2 == 0:
@@ -185,6 +149,9 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
 
         # Combining losses for action network
         total_loss_action = torch.stack(loss_lists_action).sum()
+        # Manually add weight decay (L2 regularization)
+        weight_loss_action = [config.WEIGHT_DECAY * (p ** 2).sum() for p in model_action.parameters()]
+        total_loss_action = 10 * (total_loss_action + sum(weight_loss_action)) / steps_accumulated
 
         # Backward pass and optimizer step for action network
         if (istep // 10) % 2 != 0:
@@ -217,7 +184,7 @@ def train_epoch(num_agents, model_cbf, model_action, dataloader, optimizer_cbf, 
 def main():
     args = parse_args()
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    print("Hii start")
+    print("Starting training...")
 
     # Set random seed for reproducibility
     set_random_seeds(seed)
@@ -225,8 +192,9 @@ def main():
     model_cbf = core.NetworkCBF().to(device)
     model_action = core.NetworkAction().to(device)
 
-    optimizer_cbf = optim.Adam(model_cbf.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-    optimizer_action = optim.Adam(model_action.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    # Remove weight_decay from optimizer parameters
+    optimizer_cbf = optim.Adam(model_cbf.parameters(), lr=config.LEARNING_RATE)
+    optimizer_action = optim.Adam(model_action.parameters(), lr=config.LEARNING_RATE)
 
     if args.model_path is not None:
         if os.path.exists(args.model_path):

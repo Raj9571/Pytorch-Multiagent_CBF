@@ -1,4 +1,3 @@
-
 import numpy as np
 import tensorflow as tf
 
@@ -68,6 +67,123 @@ def generate_data(num_agents, dist_min_thres):
         [states, np.zeros(shape=(num_agents, 2), dtype=np.float32)], axis=1)
     return states, goals
 
+import numpy as np
+
+def generate_data_polygons(num_agents, dist_min_thres):
+    """
+    Generate initial positions and goals for agents placed on the perimeters
+    of regular polygons (triangle, square, hexagon), ensuring that each point
+    is at least dist_min_thres apart. The polygon is chosen randomly for each batch.
+    
+    Args:
+        num_agents (int): Number of agents.
+        dist_min_thres (float): Minimum distance threshold between agents.
+        
+    Returns:
+        states (numpy.ndarray): Initial states of agents, shape (num_agents, 4).
+                                The last two columns are zeros (initial velocities).
+        goals (numpy.ndarray): Goal positions for agents, shape (num_agents, 2).
+    """
+    # Randomly select one of the polygons
+    sides_list = [3, 4, 6]  # Triangle, Square, Hexagon
+    sides = np.random.choice(sides_list)
+    
+    # Compute the minimum perimeter required to place agents with dist_min_thres apart
+    # We need enough positions to assign to both agents and goals
+    num_positions = 2 * num_agents  # Total positions along the perimeter
+    perimeter = num_positions * 2* dist_min_thres
+
+    # For a regular polygon with 'sides' sides and radius 'r',
+    # perimeter = 2 * sides * r * sin(pi / sides)
+    angle = np.pi / sides
+    perimeter_per_unit_radius = 2 * sides * np.sin(angle)
+    radius = perimeter / perimeter_per_unit_radius
+
+    # Generate positions equally spaced along the perimeter
+    segment_length = perimeter / num_positions
+    positions = []
+    for i in range(num_positions):
+        distance_along_perimeter = i * segment_length
+        position = get_point_along_polygon_perimeter(sides, radius, distance_along_perimeter)
+        positions.append(position)
+    positions = np.array(positions)
+
+    # Randomly select num_agents positions for agents
+    agent_indices = np.random.choice(num_positions, size=num_agents, replace=False)
+    agent_positions = positions[agent_indices]
+
+    # Select remaining positions for goals
+    remaining_indices = np.setdiff1d(np.arange(num_positions), agent_indices)
+    # Randomly select num_agents positions for goals from remaining positions
+    goal_indices = np.random.choice(remaining_indices, size=num_agents, replace=False)
+    goal_positions = positions[goal_indices]
+
+    # Ensure agents and goals are sufficiently separated
+    # If needed, check and enforce minimum distance between each agent and their goal
+    for i in range(num_agents):
+        agent_pos = agent_positions[i]
+        goal_pos = goal_positions[i]
+        distance = np.linalg.norm(agent_pos - goal_pos)
+        if distance < dist_min_thres:
+            # Find a new goal position that is sufficiently far from the agent
+            possible_indices = remaining_indices[remaining_indices != goal_indices[i]]
+            for idx in np.random.permutation(possible_indices):
+                new_goal_pos = positions[idx]
+                new_distance = np.linalg.norm(agent_pos - new_goal_pos)
+                if new_distance >= dist_min_thres:
+                    goal_positions[i] = new_goal_pos
+                    goal_indices[i] = idx
+                    break
+
+    # Combine positions with zero velocities to form the initial states
+    states = np.concatenate([agent_positions, np.zeros((num_agents, 2))], axis=1)
+    goals = goal_positions
+    return states, goals
+
+def get_point_along_polygon_perimeter(sides, radius, distance_along_perimeter):
+    """
+    Get a point at a specific distance along the perimeter of a regular polygon.
+    
+    Args:
+        sides (int): Number of sides of the polygon.
+        radius (float): Radius of the circumcircle of the polygon.
+        distance_along_perimeter (float): Distance along the perimeter where the point is located.
+        
+    Returns:
+        position (numpy.ndarray): Coordinates of the point, shape (2,).
+    """
+    # Generate vertices of the regular polygon
+    vertices = []
+    for i in range(sides):
+        angle = 2 * np.pi * i / sides
+        x = radius * np.cos(angle)
+        y = radius * np.sin(angle)
+        vertices.append((x, y))
+    vertices = np.array(vertices)
+
+    # Compute edge lengths and cumulative lengths
+    edge_vectors = np.roll(vertices, -1, axis=0) - vertices
+    edge_lengths = np.linalg.norm(edge_vectors, axis=1)
+    cumulative_lengths = np.cumsum(edge_lengths)
+    total_perimeter = cumulative_lengths[-1]
+
+    # Normalize the distance along the perimeter
+    distance = distance_along_perimeter % total_perimeter
+
+    # Find the edge where the distance falls
+    edge_index = np.searchsorted(cumulative_lengths, distance, side='right')
+    if edge_index == 0:
+        distance_on_edge = distance
+    else:
+        distance_on_edge = distance - cumulative_lengths[edge_index - 1]
+
+    # Compute the position along the edge
+    start_vertex = vertices[edge_index % sides]
+    edge_vector = edge_vectors[edge_index % sides]
+    edge_length = edge_lengths[edge_index % sides]
+    fraction_along_edge = distance_on_edge / edge_length
+    position = start_vertex + fraction_along_edge * edge_vector
+    return position
 
 def network_cbf(x, r, indices=None):
     d_norm = tf.sqrt(
